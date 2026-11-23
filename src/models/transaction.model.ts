@@ -56,6 +56,17 @@ const transactionSchema = new Schema<ITransaction>(
   { timestamps: true }
 );
 
+// Allow only one pending transaction per appointment.
+transactionSchema.index(
+  { appointmentId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      status: "pending"
+    }
+  }
+);
+
 const Transaction = mongoose.model<ITransaction>(
   "Transaction",
   transactionSchema
