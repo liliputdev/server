@@ -57,6 +57,34 @@ router.get("/", async (req, res) => {
 });
 
 // Public: Get one active service
+// Admin: Get all services, including inactive services
+router.get(
+  "/admin/all",
+  requireAuth,
+  requireRole("admin"),
+  async (_req, res) => {
+    try {
+      const services = await Service.find().sort({ createdAt: -1 });
+
+      return res.status(200).json({
+        success: true,
+        count: services.length,
+        services
+      });
+    } catch (error) {
+      console.error("Get all admin services error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to retrieve services"
+      });
+    }
+  }
+);
+
+// Admin: Create service
+
+// Public: Get one active service
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -80,78 +108,20 @@ router.get("/:id", async (req, res) => {
       });
     }
 
-    return res.json({
+    return res.status(200).json({
       success: true,
       service
     });
   } catch (error) {
-    console.error("Get service error:", error);
+    console.error("Get service details error:", error);
 
     return res.status(500).json({
       success: false,
-      message: "Failed to retrieve service"
+      message: "Failed to retrieve service details"
     });
   }
 });
 
-// Admin: Create service
-router.post(
-  "/",
-  requireAuth,
-  requireRole("admin"),
-  async (req, res) => {
-    try {
-      const {
-        name,
-        description,
-        category,
-        price,
-        duration,
-        image
-      } = req.body;
-
-      if (
-        typeof name !== "string" ||
-        !name.trim() ||
-        typeof description !== "string" ||
-        !description.trim() ||
-        typeof category !== "string" ||
-        !category.trim() ||
-        !Number.isFinite(price) ||
-        !Number.isFinite(duration) ||
-        price < 0 ||
-        duration < 1 ||
-        (image !== undefined && typeof image !== "string")
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: "Please provide valid service details"
-        });
-      }
-
-      const service = await Service.create({
-        name: name.trim(),
-        description: description.trim(),
-        category: category.trim(),
-        price,
-        duration,
-        image
-      });
-
-      return res.status(201).json({
-        success: true,
-        service
-      });
-    } catch (error) {
-      console.error("Create service error:", error);
-
-      return res.status(500).json({
-        success: false,
-        message: "Failed to create service"
-      });
-    }
-  }
-);
 
 // Admin: Update service
 router.patch(
