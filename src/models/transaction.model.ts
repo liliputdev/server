@@ -1,11 +1,12 @@
-import mongoose, { Schema, Document } from "mongoose";
 
+import mongoose, { Schema, Document } from "mongoose";
 
 export interface ITransaction extends Document {
   appointmentId: mongoose.Types.ObjectId;
   customerId: string;
   stripeSessionId: string;
   paymentIntentId?: string;
+  stripeEventId?: string;
   amount: number;
   currency: string;
   status: "pending" | "succeeded" | "failed";
@@ -30,6 +31,11 @@ const transactionSchema = new Schema<ITransaction>(
     paymentIntentId: {
       type: String,
       default: null
+    },
+    stripeEventId: {
+      type: String,
+      default: null,
+      index: true
     },
     amount: {
       type: Number,

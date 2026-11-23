@@ -1,9 +1,12 @@
+
 import { Router, Request, Response } from "express";
 import Stripe from "stripe";
 import mongoose from "mongoose";
+
 import Appointment from "../models/appointment.model.js";
 import Transaction from "../models/transaction.model.js";
 import { stripe } from "../config/stripe.js";
+
 import {
   requireAuth,
   requireRole
@@ -21,7 +24,10 @@ router.post(
       const { appointmentId } = req.body;
       const customerId = res.locals.user.id;
 
-      if (!mongoose.isValidObjectId(appointmentId)) {
+      if (
+        typeof appointmentId !== "string" ||
+        !mongoose.isValidObjectId(appointmentId)
+      ) {
         return res.status(400).json({
           success: false,
           message: "Invalid appointment ID"
@@ -44,6 +50,13 @@ router.post(
 
       const service = appointment.serviceId as any;
 
+      if (!service || !service.name) {
+        return res.status(400).json({
+          success: false,
+          message: "Appointment service not found"
+        });
+      }
+
       const clientUrl =
         process.env.CLIENT_URL || "http://localhost:3000";
 
@@ -51,21 +64,22 @@ router.post(
         process.env.STRIPE_CURRENCY || "bdt"
       ).toLowerCase();
 
-      // Amount is calculated from the database, never from the client.
       const amountInSmallestUnit = Math.round(
         appointment.totalAmount * 100
       );
 
-      if (amountInSmallestUnit <= 0) {
+      if (
+        !Number.isFinite(appointment.totalAmount) ||
+        amountInSmallestUnit <= 0
+      ) {
         return res.status(400).json({
           success: false,
           message: "Invalid appointment amount"
         });
       }
 
-      const session = await stripe.checkout.sessions.create({
+      const checkoutSession = await stripe.checkout.sessions.create({
         mode: "payment",
-       
         line_items: [
           {
             price_data: {
@@ -88,7 +102,7 @@ router.post(
           `${clientUrl}/payment/cancel?appointmentId=${appointment._id}`
       });
 
-      if (!session.url) {
+      if (!checkoutSession.url) {
         return res.status(500).json({
           success: false,
           message: "Could not create Stripe Checkout URL"
@@ -98,7 +112,7 @@ router.post(
       await Transaction.create({
         appointmentId: appointment._id,
         customerId,
-        stripeSessionId: session.id,
+        stripeSessionId: checkoutSession.id,
         amount: appointment.totalAmount,
         currency,
         status: "pending"
@@ -107,8 +121,9 @@ router.post(
       return res.status(201).json({
         success: true,
         message: "Checkout session created",
-        checkoutUrl: session.url
+        checkoutUrl: checkoutSession.url
       });
+
     } catch (error) {
       console.error("Stripe checkout error:", error);
 
@@ -129,11 +144,14 @@ export const handleStripeWebhook = async (
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
   if (!signature || !webhookSecret) {
-    return res.status(400).send("Missing Stripe signature or webhook secret");
+    return res.status(400).send(
+      "Missing Stripe signature or webhook secret"
+    );
   }
 
   let event: Stripe.Event;
 
+  // Verify Stripe webhook signature using the raw request body.
   try {
     event = stripe.webhooks.constructEvent(
       req.body,
@@ -142,45 +160,125 @@ export const handleStripeWebhook = async (
     );
   } catch (error) {
     console.error("Webhook signature verification failed:", error);
-    return res.status(400).send("Invalid webhook signature");
+
+    return res.status(400).send(
+      "Invalid webhook signature"
+    );
   }
 
+  // Ignore unrelated events.
+  if (event.type !== "checkout.session.completed") {
+    return res.json({ received: true });
+  }
+
+  const checkoutSession =
+    event.data.object as Stripe.Checkout.Session;
+
+  if (checkoutSession.payment_status !== "paid") {
+    return res.json({ received: true });
+  }
+
+  const appointmentId = checkoutSession.metadata?.appointmentId;
+  const customerId = checkoutSession.metadata?.customerId;
+
+  if (!appointmentId || !customerId) {
+    return res.status(400).send(
+      "Missing appointment metadata"
+    );
+  }
+
+  if (!mongoose.isValidObjectId(appointmentId)) {
+    return res.status(400).send(
+      "Invalid appointment metadata"
+    );
+  }
+
+  // Store currency locally so TypeScript can safely narrow its type.
+  const checkoutCurrency = checkoutSession.currency;
+
+  if (
+    checkoutSession.mode !== "payment" ||
+    typeof checkoutSession.amount_total !== "number" ||
+    typeof checkoutCurrency !== "string"
+  ) {
+    return res.status(400).send(
+      "Invalid Checkout session"
+    );
+  }
+
+  const dbSession = await mongoose.startSession();
+
   try {
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object as Stripe.Checkout.Session;
-
-      if (session.payment_status !== "paid") {
-        return res.json({ received: true });
-      }
-
-      const appointmentId = session.metadata?.appointmentId;
-      const customerId = session.metadata?.customerId;
-
-      if (!appointmentId || !customerId) {
-        return res.status(400).send("Missing appointment metadata");
-      }
-
+    await dbSession.withTransaction(async () => {
       const transaction = await Transaction.findOne({
-        stripeSessionId: session.id,
+        stripeSessionId: checkoutSession.id,
         appointmentId,
         customerId
-      });
+      }).session(dbSession);
 
       if (!transaction) {
-        return res.status(404).send("Transaction not found");
+        throw new Error("Transaction not found");
       }
 
-      // Record the verified payment.
+      // Prevent duplicate processing of successful payments.
+      if (transaction.status === "succeeded") {
+        return;
+      }
+
+      const expectedAmount = Math.round(
+        transaction.amount * 100
+      );
+
+      const expectedCurrency =
+        transaction.currency.toLowerCase();
+
+      // Verify actual Stripe payment amount and currency.
+      if (
+        checkoutSession.amount_total !== expectedAmount ||
+        checkoutCurrency.toLowerCase() !== expectedCurrency
+      ) {
+        throw new Error(
+          "Stripe payment amount or currency mismatch"
+        );
+      }
+
+      const appointment = await Appointment.findOne({
+        _id: appointmentId,
+        customerId,
+        status: "confirmed",
+        paymentStatus: "unpaid"
+      }).session(dbSession);
+
+      if (!appointment) {
+        throw new Error(
+          "Confirmed unpaid appointment not found"
+        );
+      }
+
+      // Verify appointment amount against transaction.
+      if (
+        Math.round(appointment.totalAmount * 100) !==
+        expectedAmount
+      ) {
+        throw new Error(
+          "Appointment amount does not match transaction"
+        );
+      }
+
+      // Update transaction.
       transaction.status = "succeeded";
+
       transaction.paymentIntentId =
-        typeof session.payment_intent === "string"
-          ? session.payment_intent
+        typeof checkoutSession.payment_intent === "string"
+          ? checkoutSession.payment_intent
           : undefined;
 
-      await transaction.save();
+      await transaction.save({
+        session: dbSession
+      });
 
-      // Only update the matching customer's confirmed appointment.
-      await Appointment.updateOne(
+      // Mark appointment as paid.
+      const appointmentUpdate = await Appointment.updateOne(
         {
           _id: appointmentId,
           customerId,
@@ -188,15 +286,36 @@ export const handleStripeWebhook = async (
           paymentStatus: "unpaid"
         },
         {
-          $set: { paymentStatus: "paid" }
+          $set: {
+            paymentStatus: "paid"
+          }
+        },
+        {
+          session: dbSession
         }
       );
-    }
+
+      if (appointmentUpdate.modifiedCount !== 1) {
+        throw new Error(
+          "Could not update appointment payment status"
+        );
+      }
+    });
 
     return res.json({ received: true });
+
   } catch (error) {
-    console.error("Webhook processing error:", error);
-    return res.status(500).send("Webhook processing failed");
+    console.error(
+      "Stripe webhook processing error:",
+      error
+    );
+
+    return res.status(500).send(
+      "Webhook processing failed"
+    );
+
+  } finally {
+    await dbSession.endSession();
   }
 };
 
