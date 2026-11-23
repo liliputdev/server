@@ -193,7 +193,6 @@ export const handleStripeWebhook = async (
     );
   }
 
-  // Store currency locally so TypeScript can safely narrow its type.
   const checkoutCurrency = checkoutSession.currency;
 
   if (
@@ -220,8 +219,11 @@ export const handleStripeWebhook = async (
         throw new Error("Transaction not found");
       }
 
-      // Prevent duplicate processing of successful payments.
-      if (transaction.status === "succeeded") {
+      // Ignore duplicate webhook events and completed payments.
+      if (
+        transaction.stripeEventId === event.id ||
+        transaction.status === "succeeded"
+      ) {
         return;
       }
 
@@ -265,8 +267,9 @@ export const handleStripeWebhook = async (
         );
       }
 
-      // Update transaction.
+      // Update transaction and store the processed event ID.
       transaction.status = "succeeded";
+      transaction.stripeEventId = event.id;
 
       transaction.paymentIntentId =
         typeof checkoutSession.payment_intent === "string"
