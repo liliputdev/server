@@ -1,0 +1,406 @@
+
+import { Router, Request, Response } from "express";
+import Stripe from "stripe";
+import mongoose from "mongoose";
+
+import Appointment from "../models/appointment.model.js";
+import Transaction from "../models/transaction.model.js";
+import { stripe } from "../config/stripe.js";
+
+import {
+  requireAuth,
+  requireRole
+} from "../middlewares/auth.middleware.js";
+
+const router = Router();
+
+// Customer: Create or reuse Stripe Checkout Session
+router.post(
+  "/checkout-session",
+  requireAuth,
+  requireRole("customer"),
+  async (req: Request, res: Response) => {
+    let newCheckoutSession: Stripe.Checkout.Session | null = null;
+
+    try {
+      const { appointmentId } = req.body;
+      const customerId = res.locals.user.id;
+
+      if (
+        typeof appointmentId !== "string" ||
+        !mongoose.isValidObjectId(appointmentId)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid appointment ID"
+        });
+      }
+
+      const appointment = await Appointment.findOne({
+        _id: appointmentId,
+        customerId,
+        status: "confirmed",
+        paymentStatus: "unpaid"
+      }).populate("serviceId");
+
+      if (!appointment) {
+        return res.status(404).json({
+          success: false,
+          message: "Confirmed unpaid appointment not found"
+        });
+      }
+
+      // Check for an existing pending transaction.
+      const existingTransaction = await Transaction.findOne({
+        appointmentId: appointment._id,
+        customerId,
+        status: "pending"
+      });
+
+      if (existingTransaction) {
+        const existingSession =
+          await stripe.checkout.sessions.retrieve(
+            existingTransaction.stripeSessionId
+          );
+
+        // Reuse an active Checkout session.
+        if (
+          existingSession.status === "open" &&
+          existingSession.url
+        ) {
+          return res.status(200).json({
+            success: true,
+            message: "Existing checkout session reused",
+            checkoutUrl: existingSession.url
+          });
+        }
+
+        // An expired session can safely be replaced.
+        if (existingSession.status === "expired") {
+          existingTransaction.status = "failed";
+          await existingTransaction.save();
+        } else {
+          // A completed session may still be processing payment.
+          return res.status(409).json({
+            success: false,
+            message:
+              "Your previous payment is processing. Please wait before trying again."
+          });
+        }
+      }
+
+      const service = appointment.serviceId as any;
+
+      if (!service || !service.name) {
+        return res.status(400).json({
+          success: false,
+          message: "Appointment service not found"
+        });
+      }
+
+      const clientUrl =
+        process.env.CLIENT_URL || "http://localhost:3000";
+
+      const currency = (
+        process.env.STRIPE_CURRENCY || "bdt"
+      ).toLowerCase();
+
+      const amountInSmallestUnit = Math.round(
+        appointment.totalAmount * 100
+      );
+
+      if (
+        !Number.isFinite(appointment.totalAmount) ||
+        amountInSmallestUnit <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid appointment amount"
+        });
+      }
+
+      // Create a new Stripe Checkout session.
+      newCheckoutSession =
+        await stripe.checkout.sessions.create({
+          mode: "payment",
+          line_items: [
+            {
+              price_data: {
+                currency,
+                product_data: {
+                  name: service.name
+                },
+                unit_amount: amountInSmallestUnit
+              },
+              quantity: 1
+            }
+          ],
+          metadata: {
+            appointmentId: appointment._id.toString(),
+            customerId
+          },
+          success_url:
+            `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url:
+            `${clientUrl}/payment/cancel?appointmentId=${appointment._id}`
+        });
+
+      if (!newCheckoutSession.url) {
+        await stripe.checkout.sessions.expire(
+          newCheckoutSession.id
+        );
+
+        return res.status(500).json({
+          success: false,
+          message: "Could not create Stripe Checkout URL"
+        });
+      }
+
+      // Save the transaction in MongoDB.
+      await Transaction.create({
+        appointmentId: appointment._id,
+        customerId,
+        stripeSessionId: newCheckoutSession.id,
+        amount: appointment.totalAmount,
+        currency,
+        status: "pending"
+      });
+
+      return res.status(201).json({
+        success: true,
+        message: "Checkout session created",
+        checkoutUrl: newCheckoutSession.url
+      });
+
+    } catch (error) {
+      console.error("Stripe checkout error:", error);
+
+      // Expire an orphaned Stripe session if database saving failed.
+      if (newCheckoutSession?.status === "open") {
+        try {
+          await stripe.checkout.sessions.expire(
+            newCheckoutSession.id
+          );
+        } catch (expireError) {
+          console.error(
+            "Could not expire unused Stripe session:",
+            expireError
+          );
+        }
+      }
+
+      // Handle duplicate pending transaction index violations.
+      if (
+        error instanceof mongoose.mongo.MongoServerError &&
+        error.code === 11000
+      ) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "A payment session already exists for this appointment. Please try again."
+        });
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create checkout session"
+      });
+    }
+  }
+);
+
+// Stripe Webhook Handler
+export const handleStripeWebhook = async (
+  req: Request,
+  res: Response
+) => {
+  const signature = req.headers["stripe-signature"];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!signature || !webhookSecret) {
+    return res.status(400).send(
+      "Missing Stripe signature or webhook secret"
+    );
+  }
+
+  let event: Stripe.Event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      signature,
+      webhookSecret
+    );
+  } catch (error) {
+    console.error(
+      "Webhook signature verification failed:",
+      error
+    );
+
+    return res.status(400).send(
+      "Invalid webhook signature"
+    );
+  }
+
+  if (event.type !== "checkout.session.completed") {
+    return res.json({ received: true });
+  }
+
+  const checkoutSession =
+    event.data.object as Stripe.Checkout.Session;
+
+  if (checkoutSession.payment_status !== "paid") {
+    return res.json({ received: true });
+  }
+
+  const appointmentId =
+    checkoutSession.metadata?.appointmentId;
+
+  const customerId =
+    checkoutSession.metadata?.customerId;
+
+  if (!appointmentId || !customerId) {
+    return res.status(400).send(
+      "Missing appointment metadata"
+    );
+  }
+
+  if (!mongoose.isValidObjectId(appointmentId)) {
+    return res.status(400).send(
+      "Invalid appointment metadata"
+    );
+  }
+
+  const checkoutCurrency = checkoutSession.currency;
+
+  if (
+    checkoutSession.mode !== "payment" ||
+    typeof checkoutSession.amount_total !== "number" ||
+    typeof checkoutCurrency !== "string"
+  ) {
+    return res.status(400).send(
+      "Invalid Checkout session"
+    );
+  }
+
+  const dbSession = await mongoose.startSession();
+
+  try {
+    await dbSession.withTransaction(async () => {
+      const transaction = await Transaction.findOne({
+        stripeSessionId: checkoutSession.id,
+        appointmentId,
+        customerId
+      }).session(dbSession);
+
+      if (!transaction) {
+        throw new Error("Transaction not found");
+      }
+
+      // Ignore already-processed successful payments.
+      if (
+        transaction.stripeEventId === event.id ||
+        transaction.status === "succeeded"
+      ) {
+        return;
+      }
+
+      if (transaction.status !== "pending") {
+        throw new Error(
+          "Transaction is not in pending status"
+        );
+      }
+
+      const expectedAmount = Math.round(
+        transaction.amount * 100
+      );
+
+      const expectedCurrency =
+        transaction.currency.toLowerCase();
+
+      if (
+        checkoutSession.amount_total !== expectedAmount ||
+        checkoutCurrency.toLowerCase() !== expectedCurrency
+      ) {
+        throw new Error(
+          "Stripe payment amount or currency mismatch"
+        );
+      }
+
+      const appointment = await Appointment.findOne({
+        _id: appointmentId,
+        customerId,
+        status: "confirmed",
+        paymentStatus: "unpaid"
+      }).session(dbSession);
+
+      if (!appointment) {
+        throw new Error(
+          "Confirmed unpaid appointment not found"
+        );
+      }
+
+      if (
+        Math.round(appointment.totalAmount * 100) !==
+        expectedAmount
+      ) {
+        throw new Error(
+          "Appointment amount does not match transaction"
+        );
+      }
+
+      transaction.status = "succeeded";
+      transaction.stripeEventId = event.id;
+
+      transaction.paymentIntentId =
+        typeof checkoutSession.payment_intent === "string"
+          ? checkoutSession.payment_intent
+          : undefined;
+
+      await transaction.save({
+        session: dbSession
+      });
+
+      const appointmentUpdate =
+        await Appointment.updateOne(
+          {
+            _id: appointmentId,
+            customerId,
+            status: "confirmed",
+            paymentStatus: "unpaid"
+          },
+          {
+            $set: {
+              paymentStatus: "paid"
+            }
+          },
+          {
+            session: dbSession
+          }
+        );
+
+      if (appointmentUpdate.modifiedCount !== 1) {
+        throw new Error(
+          "Could not update appointment payment status"
+        );
+      }
+    });
+
+    return res.json({ received: true });
+
+  } catch (error) {
+    console.error(
+      "Stripe webhook processing error:",
+      error
+    );
+
+    return res.status(500).send(
+      "Webhook processing failed"
+    );
+
+  } finally {
+    await dbSession.endSession();
+  }
+};
+
+export default router;
