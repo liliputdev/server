@@ -3,3 +3,10 @@ dist/
 .env
 .env.*
 !.env.example
+# Generated build files
+dist/
+
+# Authentication test cookies
+cookies.txt
+admin-cookies.txt
+customer-cookies.txt
