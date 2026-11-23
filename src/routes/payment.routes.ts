@@ -14,12 +14,14 @@ import {
 
 const router = Router();
 
-// Customer: Create Stripe Checkout Session
+// Customer: Create or reuse Stripe Checkout Session
 router.post(
   "/checkout-session",
   requireAuth,
   requireRole("customer"),
   async (req: Request, res: Response) => {
+    let newCheckoutSession: Stripe.Checkout.Session | null = null;
+
     try {
       const { appointmentId } = req.body;
       const customerId = res.locals.user.id;
@@ -48,7 +50,7 @@ router.post(
         });
       }
 
-      // Prevent another pending payment session.
+      // Check for an existing pending transaction.
       const existingTransaction = await Transaction.findOne({
         appointmentId: appointment._id,
         customerId,
@@ -56,11 +58,35 @@ router.post(
       });
 
       if (existingTransaction) {
-        return res.status(409).json({
-          success: false,
-          message:
-            "A payment session already exists for this appointment. Please complete or cancel the existing payment."
-        });
+        const existingSession =
+          await stripe.checkout.sessions.retrieve(
+            existingTransaction.stripeSessionId
+          );
+
+        // Reuse an active Checkout session.
+        if (
+          existingSession.status === "open" &&
+          existingSession.url
+        ) {
+          return res.status(200).json({
+            success: true,
+            message: "Existing checkout session reused",
+            checkoutUrl: existingSession.url
+          });
+        }
+
+        // An expired session can safely be replaced.
+        if (existingSession.status === "expired") {
+          existingTransaction.status = "failed";
+          await existingTransaction.save();
+        } else {
+          // A completed session may still be processing payment.
+          return res.status(409).json({
+            success: false,
+            message:
+              "Your previous payment is processing. Please wait before trying again."
+          });
+        }
       }
 
       const service = appointment.serviceId as any;
@@ -93,41 +119,48 @@ router.post(
         });
       }
 
-      const checkoutSession = await stripe.checkout.sessions.create({
-        mode: "payment",
-        line_items: [
-          {
-            price_data: {
-              currency,
-              product_data: {
-                name: service.name
+      // Create a new Stripe Checkout session.
+      newCheckoutSession =
+        await stripe.checkout.sessions.create({
+          mode: "payment",
+          line_items: [
+            {
+              price_data: {
+                currency,
+                product_data: {
+                  name: service.name
+                },
+                unit_amount: amountInSmallestUnit
               },
-              unit_amount: amountInSmallestUnit
-            },
-            quantity: 1
-          }
-        ],
-        metadata: {
-          appointmentId: appointment._id.toString(),
-          customerId
-        },
-        success_url:
-          `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url:
-          `${clientUrl}/payment/cancel?appointmentId=${appointment._id}`
-      });
+              quantity: 1
+            }
+          ],
+          metadata: {
+            appointmentId: appointment._id.toString(),
+            customerId
+          },
+          success_url:
+            `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url:
+            `${clientUrl}/payment/cancel?appointmentId=${appointment._id}`
+        });
 
-      if (!checkoutSession.url) {
+      if (!newCheckoutSession.url) {
+        await stripe.checkout.sessions.expire(
+          newCheckoutSession.id
+        );
+
         return res.status(500).json({
           success: false,
           message: "Could not create Stripe Checkout URL"
         });
       }
 
+      // Save the transaction in MongoDB.
       await Transaction.create({
         appointmentId: appointment._id,
         customerId,
-        stripeSessionId: checkoutSession.id,
+        stripeSessionId: newCheckoutSession.id,
         amount: appointment.totalAmount,
         currency,
         status: "pending"
@@ -136,11 +169,37 @@ router.post(
       return res.status(201).json({
         success: true,
         message: "Checkout session created",
-        checkoutUrl: checkoutSession.url
+        checkoutUrl: newCheckoutSession.url
       });
 
     } catch (error) {
       console.error("Stripe checkout error:", error);
+
+      // Expire an orphaned Stripe session if database saving failed.
+      if (newCheckoutSession?.status === "open") {
+        try {
+          await stripe.checkout.sessions.expire(
+            newCheckoutSession.id
+          );
+        } catch (expireError) {
+          console.error(
+            "Could not expire unused Stripe session:",
+            expireError
+          );
+        }
+      }
+
+      // Handle duplicate pending transaction index violations.
+      if (
+        error instanceof mongoose.mongo.MongoServerError &&
+        error.code === 11000
+      ) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "A payment session already exists for this appointment. Please try again."
+        });
+      }
 
       return res.status(500).json({
         success: false,
@@ -173,7 +232,10 @@ export const handleStripeWebhook = async (
       webhookSecret
     );
   } catch (error) {
-    console.error("Webhook signature verification failed:", error);
+    console.error(
+      "Webhook signature verification failed:",
+      error
+    );
 
     return res.status(400).send(
       "Invalid webhook signature"
@@ -191,8 +253,11 @@ export const handleStripeWebhook = async (
     return res.json({ received: true });
   }
 
-  const appointmentId = checkoutSession.metadata?.appointmentId;
-  const customerId = checkoutSession.metadata?.customerId;
+  const appointmentId =
+    checkoutSession.metadata?.appointmentId;
+
+  const customerId =
+    checkoutSession.metadata?.customerId;
 
   if (!appointmentId || !customerId) {
     return res.status(400).send(
@@ -232,12 +297,18 @@ export const handleStripeWebhook = async (
         throw new Error("Transaction not found");
       }
 
-      // Ignore already-processed events and successful payments.
+      // Ignore already-processed successful payments.
       if (
         transaction.stripeEventId === event.id ||
         transaction.status === "succeeded"
       ) {
         return;
+      }
+
+      if (transaction.status !== "pending") {
+        throw new Error(
+          "Transaction is not in pending status"
+        );
       }
 
       const expectedAmount = Math.round(
@@ -278,7 +349,6 @@ export const handleStripeWebhook = async (
         );
       }
 
-      // Save the successful payment and Stripe event ID.
       transaction.status = "succeeded";
       transaction.stripeEventId = event.id;
 
@@ -291,22 +361,23 @@ export const handleStripeWebhook = async (
         session: dbSession
       });
 
-      const appointmentUpdate = await Appointment.updateOne(
-        {
-          _id: appointmentId,
-          customerId,
-          status: "confirmed",
-          paymentStatus: "unpaid"
-        },
-        {
-          $set: {
-            paymentStatus: "paid"
+      const appointmentUpdate =
+        await Appointment.updateOne(
+          {
+            _id: appointmentId,
+            customerId,
+            status: "confirmed",
+            paymentStatus: "unpaid"
+          },
+          {
+            $set: {
+              paymentStatus: "paid"
+            }
+          },
+          {
+            session: dbSession
           }
-        },
-        {
-          session: dbSession
-        }
-      );
+        );
 
       if (appointmentUpdate.modifiedCount !== 1) {
         throw new Error(
