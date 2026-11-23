@@ -48,6 +48,21 @@ router.post(
         });
       }
 
+      // Prevent another pending payment session.
+      const existingTransaction = await Transaction.findOne({
+        appointmentId: appointment._id,
+        customerId,
+        status: "pending"
+      });
+
+      if (existingTransaction) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "A payment session already exists for this appointment. Please complete or cancel the existing payment."
+        });
+      }
+
       const service = appointment.serviceId as any;
 
       if (!service || !service.name) {
@@ -151,7 +166,6 @@ export const handleStripeWebhook = async (
 
   let event: Stripe.Event;
 
-  // Verify Stripe webhook signature using the raw request body.
   try {
     event = stripe.webhooks.constructEvent(
       req.body,
@@ -166,7 +180,6 @@ export const handleStripeWebhook = async (
     );
   }
 
-  // Ignore unrelated events.
   if (event.type !== "checkout.session.completed") {
     return res.json({ received: true });
   }
@@ -219,7 +232,7 @@ export const handleStripeWebhook = async (
         throw new Error("Transaction not found");
       }
 
-      // Ignore duplicate webhook events and completed payments.
+      // Ignore already-processed events and successful payments.
       if (
         transaction.stripeEventId === event.id ||
         transaction.status === "succeeded"
@@ -234,7 +247,6 @@ export const handleStripeWebhook = async (
       const expectedCurrency =
         transaction.currency.toLowerCase();
 
-      // Verify actual Stripe payment amount and currency.
       if (
         checkoutSession.amount_total !== expectedAmount ||
         checkoutCurrency.toLowerCase() !== expectedCurrency
@@ -257,7 +269,6 @@ export const handleStripeWebhook = async (
         );
       }
 
-      // Verify appointment amount against transaction.
       if (
         Math.round(appointment.totalAmount * 100) !==
         expectedAmount
@@ -267,7 +278,7 @@ export const handleStripeWebhook = async (
         );
       }
 
-      // Update transaction and store the processed event ID.
+      // Save the successful payment and Stripe event ID.
       transaction.status = "succeeded";
       transaction.stripeEventId = event.id;
 
@@ -280,7 +291,6 @@ export const handleStripeWebhook = async (
         session: dbSession
       });
 
-      // Mark appointment as paid.
       const appointmentUpdate = await Appointment.updateOne(
         {
           _id: appointmentId,
